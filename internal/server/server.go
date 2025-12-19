@@ -15,6 +15,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -30,6 +31,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/exporter-toolkit/web"
 )
 
@@ -50,6 +52,9 @@ func New(cfg *config.Config) *Server {
 
 // Start starts the HTTP server.
 func (s *Server) Start() error {
+	// Initialize global test lock
+	InitGlobalTestLock(s.logger)
+
 	// Register version and process collectors
 	prometheus.MustRegister(versioncollector.NewCollector("iperf3_exporter"))
 	prometheus.MustRegister(collectors.NewBuildInfoCollector())
@@ -69,6 +74,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/", s.indexHandler)
 	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("/ready", s.readyHandler)
+	mux.HandleFunc("/lock-status", s.lockStatusHandler)
 
 	// Register pprof handlers
 	mux.HandleFunc("/debug/pprof/", http.DefaultServeMux.ServeHTTP)
@@ -79,10 +85,11 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/debug/pprof/heap", http.DefaultServeMux.ServeHTTP)
 
 	// Create HTTP server
+	// Increased timeouts to accommodate bidirectional tests (2 * 30s + overhead)
 	s.server = &http.Server{
 		Handler:      handler,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		ReadTimeout:  120 * time.Second,
+		WriteTimeout: 120 * time.Second,
 	}
 
 	// Start server using exporter-toolkit
@@ -130,6 +137,7 @@ func (s *Server) probeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var reverseMode bool
+	var bidirectionalMode bool
 
 	reverseParam := r.URL.Query().Get("reverse_mode")
 	if reverseParam != "" {
@@ -138,6 +146,20 @@ func (s *Server) probeHandler(w http.ResponseWriter, r *http.Request) {
 		reverseMode, err = strconv.ParseBool(reverseParam)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("'reverse_mode' parameter must be true or false (boolean): %s", err), http.StatusBadRequest)
+			collector.IperfErrors.Inc()
+
+			return
+		}
+	}
+
+	// Check for bidirectional mode (enhanced feature by ThanhDeptr)
+	bidirectionalParam := r.URL.Query().Get("bidirectional")
+	if bidirectionalParam != "" {
+		var err error
+
+		bidirectionalMode, err = strconv.ParseBool(bidirectionalParam)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'bidirectional' parameter must be true or false (boolean): %s", err), http.StatusBadRequest)
 			collector.IperfErrors.Inc()
 
 			return
@@ -225,26 +247,138 @@ func (s *Server) probeHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	registry := prometheus.NewRegistry()
 
+	// Parse bind_address parameter (enhanced feature by ThanhDeptr)
+	bindAddress := r.URL.Query().Get("bind_address")
+
+	// Parse parallel parameter (enhanced feature by ThanhDeptr)
+	var parallel int
+	parallelParam := r.URL.Query().Get("parallel")
+	if parallelParam != "" {
+		var err error
+		parallel, err = strconv.Atoi(parallelParam)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'parallel' parameter must be an integer: %s", err), http.StatusBadRequest)
+			collector.IperfErrors.Inc()
+
+			return
+		}
+		if parallel < 1 {
+			http.Error(w, "'parallel' parameter must be at least 1", http.StatusBadRequest)
+			collector.IperfErrors.Inc()
+
+			return
+		}
+	}
+
+	// Debug logging to verify parameters are parsed correctly
+	s.logger.Info("Probe parameters parsed",
+		"target", target,
+		"port", targetPort,
+		"bind_address", bindAddress,
+		"parallel", parallel,
+		"reverse_mode", reverseMode,
+		"bidirectional", bidirectionalMode,
+		"period", runPeriod,
+	)
+
+	// Try to acquire global test lock with 500s timeout
+	requesterID := fmt.Sprintf("%s:%d", target, targetPort)
+	testLock := GetGlobalTestLock()
+
+	lockCtx, lockCancel := context.WithTimeout(r.Context(), 500*time.Second)
+	defer lockCancel()
+
+	if !testLock.TryLock(lockCtx, requesterID) {
+		s.logger.Error("Failed to acquire test lock within 500s timeout", "requester", requesterID)
+		http.Error(w, "iPerf3 test lock timeout: server is busy and wait queue is full", http.StatusServiceUnavailable)
+		collector.IperfErrors.Inc()
+		return
+	}
+
+	// Ensure lock is released when handler exits
+	defer func() {
+		testLock.Unlock(requesterID)
+		s.logger.Info("Released test lock", "requester", requesterID)
+	}()
+
 	// Create collector with probe configuration
 	probeConfig := collector.ProbeConfig{
-		Target:      target,
-		Port:        targetPort,
-		Period:      runPeriod,
-		Timeout:     runTimeout,
-		ReverseMode: reverseMode,
-		UDPMode:     udpMode,
-		Bitrate:     bitrate,
+		Target:        target,
+		Port:          targetPort,
+		Period:        runPeriod,
+		Timeout:       runTimeout,
+		ReverseMode:   reverseMode,
+		Bidirectional: bidirectionalMode,
+		UDPMode:       udpMode,
+		Bitrate:       bitrate,
+		BindAddress:   bindAddress,
+		Parallel:      parallel,
+		Context:       r.Context(), // Request context for proper cancellation
 	}
 
 	c := collector.NewCollector(probeConfig, s.logger)
 	registry.MustRegister(c)
 
-	// Delegate http serving to Prometheus client library, which will call collector.Collect.
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
+	// 1. Actively collect metrics.
+	//    The Gather function will call c.Collect(), which will run iperf3 with the context above.
+	//    If the client disconnects, iperf3 is killed, and Gather will return an error immediately.
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		s.logger.Error("Failed to gather metrics", "error", err, "requester", requesterID)
+		http.Error(w, fmt.Sprintf("Failed to gather metrics: %v", err), http.StatusInternalServerError)
+		collector.IperfErrors.Inc()
+		return // Exit safely, lock will be released
+	}
+
+	// 2. Encode all metrics into a buffer in memory.
+	//    This operation is very fast and does not depend on the network.
+	var buf bytes.Buffer
+	encoder := expfmt.NewEncoder(&buf, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, mf := range metricFamilies {
+		if err := encoder.Encode(mf); err != nil {
+			s.logger.Error("Failed to encode metric family", "error", err, "requester", requesterID)
+			http.Error(w, fmt.Sprintf("Failed to encode metrics: %v", err), http.StatusInternalServerError)
+			collector.IperfErrors.Inc()
+			return // Exit safely
+		}
+	}
+
+	// 3. Write the entire buffer to ResponseWriter in a single operation.
+	w.Header().Set("Content-Type", string(expfmt.NewFormat(expfmt.TypeTextPlain)))
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		s.logger.Warn("Error writing response body", "error", err, "requester", requesterID)
+	}
 
 	duration := time.Since(start).Seconds()
 	collector.IperfDuration.Observe(duration)
+}
+
+// lockStatusHandler handles requests to the /lock-status endpoint
+func (s *Server) lockStatusHandler(w http.ResponseWriter, r *http.Request) {
+	testLock := GetGlobalTestLock()
+	status := testLock.GetStatus()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	// Enhanced JSON response with queue information
+	response := fmt.Sprintf(`{
+		"is_locked": %t,
+		"locked_by": "%v",
+		"locked_at": "%v",
+		"lock_duration": "%v",
+		"queue_size": %v
+	}`,
+		status["is_locked"],
+		status["locked_by"],
+		status["locked_at"],
+		status["lock_duration"],
+		status["queue_size"])
+
+	if _, err := w.Write([]byte(response)); err != nil {
+		s.logger.Error("Failed to write lock status response", "error", err)
+	}
 }
 
 // indexHandler handles requests to the / endpoint using the exporter-toolkit landing page.
