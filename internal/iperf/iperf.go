@@ -18,11 +18,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -135,6 +137,8 @@ type Config struct {
 	ReverseMode bool
 	UDPMode     bool
 	Bitrate     string
+	BindAddress string // Source IP address to bind to (-B parameter) - Enhanced by ThanhDeptr
+	Parallel    int    // Number of parallel streams (-P parameter) - Enhanced by ThanhDeptr
 	Logger      *slog.Logger
 }
 
@@ -188,6 +192,15 @@ func (r *DefaultRunner) Run(ctx context.Context, cfg Config) Result {
 		iperfArgs = append(iperfArgs, "-u")
 	}
 
+	// Enhanced features by ThanhDeptr
+	if cfg.BindAddress != "" {
+		iperfArgs = append(iperfArgs, "-B", cfg.BindAddress)
+	}
+
+	if cfg.Parallel > 0 {
+		iperfArgs = append(iperfArgs, "-P", strconv.Itoa(cfg.Parallel))
+	}
+
 	// Apply bitrate:
 	// - For UDP: use specified bitrate or default to "1M" if none specified (iperf3 defaults to 1Mbps for UDP)
 	// - For TCP: only apply if explicitly specified (iperf3 defaults to unlimited for TCP)
@@ -214,10 +227,7 @@ func (r *DefaultRunner) Run(ctx context.Context, cfg Config) Result {
 		cmd = execCommand(GetIperfCmd(), iperfArgs...)
 	}
 
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	// Execute the command
+	// Execute the command with retry logic
 	cfg.Logger.Debug("Running iperf3 command",
 		"target", cfg.Target,
 		"port", cfg.Port,
@@ -225,21 +235,132 @@ func (r *DefaultRunner) Run(ctx context.Context, cfg Config) Result {
 		"reverse", cfg.ReverseMode,
 		"udp", cfg.UDPMode,
 		"bitrate", cfg.Bitrate,
+		"bind_address", cfg.BindAddress,
+		"parallel", cfg.Parallel,
+		"command", GetIperfCmd(),
+		"args", iperfArgs,
 	)
 
-	out, err := cmd.Output()
+	// Retry logic for recoverable errors
+	const maxRetries = 3
+	const retryDelay = 3 * time.Second
+
+	var output []byte
+	var err error
+	var lastCommandString string
+	var lastIperf3Output string
+
+	// **BẮT ĐẦU VÒNG LẶP THỬ LẠI**
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Luôn kiểm tra xem context đã bị hủy chưa (do scrape timeout)
+		if ctx.Err() != nil {
+			cfg.Logger.Warn("Probe cancelled before retry attempt, stopping.", "attempt", attempt)
+			err = ctx.Err() // Gán lỗi context để báo cáo ở cuối
+			break
+		}
+
+		if attempt > 1 {
+			cfg.Logger.Info("Retrying iPerf3 test due to recoverable error...", 
+				"attempt", attempt, 
+				"max_retries", maxRetries,
+				"error", err.Error(),
+				"output", lastIperf3Output)
+			time.Sleep(retryDelay) // Chỉ chờ nếu đây là lần thử lại
+		}
+
+		// Tạo lại command cho mỗi lần thử
+		if ctx != nil {
+			cmd = execCommandContext(ctx, GetIperfCmd(), iperfArgs...)
+		} else {
+			cmd = execCommand(GetIperfCmd(), iperfArgs...)
+		}
+
+		lastCommandString = cmd.String() // Lưu lại để ghi log
+		output, err = cmd.CombinedOutput()
+		lastIperf3Output = string(bytes.TrimSpace(output)) // Lưu lại output của lần chạy cuối
+
+		// **Nếu thành công, thoát khỏi vòng lặp ngay lập tức**
+		if err == nil {
+			break
+		}
+
+		// **Phân tích lỗi để quyết định có thử lại hay không**
+		var isRetryable bool
+		
+		// Check for specific iperf3 error messages
+		if lastIperf3Output != "" {
+			isRetryable = strings.Contains(lastIperf3Output, "Connection refused") ||
+						  strings.Contains(lastIperf3Output, "the server is busy") ||
+						  strings.Contains(lastIperf3Output, "Connection reset by peer")
+		} else {
+			// If no output but we have an error, check if it's a retryable runtime error
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				// Retry on exit code -1 (often process killed) or other recoverable codes
+				isRetryable = exitErr.ExitCode() == -1 || exitErr.ExitCode() == 1
+			} else {
+				// For non-exit errors (like context cancelled), don't retry
+				isRetryable = false
+			}
+		}
+
+		// Log retry decision for debugging
+		if attempt < maxRetries {
+			if isRetryable {
+				cfg.Logger.Debug("Error is retryable, will retry", 
+					"attempt", attempt, 
+					"error", err.Error(),
+					"output", lastIperf3Output)
+			} else {
+				cfg.Logger.Debug("Error is not retryable, stopping", 
+					"attempt", attempt, 
+					"error", err.Error(),
+					"output", lastIperf3Output)
+			}
+		}
+
+		// Nếu lỗi không thể phục hồi, hoặc đã hết số lần thử, thoát vòng lặp
+		if !isRetryable || attempt == maxRetries {
+			break
+		}
+	}
+	// **KẾT THÚC VÒNG LẶP THỬ LẠI**
+
+	// Enhanced error handling with detailed categorization
 	if err != nil {
-		stderrOutput := stderr.String()
-		if stderrOutput != "" {
-			cfg.Logger.Error("Failed to run iperf3",
-				"err", err,
-				"stderr", stderrOutput,
+		var exitErr *exec.ExitError
+
+		// Check if this is an exit error (process exited with non-zero code)
+		if errors.As(err, &exitErr) {
+			// This is the case of "exit status 1" or similar
+			cfg.Logger.Error(
+				"iPerf3 test failed after all retries", // Updated message
+				"reason", "iperf3 reported a final connection error.",
+				"exit_code", exitErr.ExitCode(),
+				// This line is most important, it prints detailed error from iperf3
+				"iperf3_output", lastIperf3Output,
+				"command", lastCommandString,
 			)
 
-			result.Error = fmt.Errorf("iperf3 execution failed: %w: %s", err, stderrOutput)
+			result.Error = fmt.Errorf("iperf3 execution failed with exit code %d: %s", exitErr.ExitCode(), lastIperf3Output)
+
+			// Handle other error cases (e.g., process killed)
+		} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			cfg.Logger.Warn(
+				"iPerf3 process was killed",
+				"reason", "Process was likely killed by scrape timeout.",
+				"error_details", err.Error(),
+				"command", lastCommandString,
+			)
+
+			result.Error = fmt.Errorf("iperf3 execution timed out or was canceled: %w", err)
+
 		} else {
-			cfg.Logger.Error("Failed to run iperf3",
-				"err", err,
+			cfg.Logger.Error(
+				"Failed to execute iperf3 command",
+				"reason", "An unexpected execution error occurred.",
+				"error_details", err.Error(),
+				"command", lastCommandString,
 			)
 
 			result.Error = fmt.Errorf("iperf3 execution failed: %w", err)
@@ -247,6 +368,9 @@ func (r *DefaultRunner) Run(ctx context.Context, cfg Config) Result {
 
 		return result
 	}
+
+	// If no error, continue processing output as normal...
+	out := output
 
 	// Parse the JSON output
 	var raw rawResult
