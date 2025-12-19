@@ -94,10 +94,6 @@ type Collector struct {
 	up                    *prometheus.Desc
 	bandwidthUploadMbps   *prometheus.Desc
 	bandwidthDownloadMbps *prometheus.Desc
-	sentSeconds        *prometheus.Desc
-	sentBytes          *prometheus.Desc
-	receivedSeconds    *prometheus.Desc
-	receivedBytes      *prometheus.Desc
 	retransmits           *prometheus.Desc // TCP only
 	jitter                *prometheus.Desc // UDP only
 
@@ -186,27 +182,6 @@ func NewCollectorWithRunner(config ProbeConfig, logger *slog.Logger, runner iper
 		),
 		pingLatencyMinMs: prometheus.NewDesc(
 			prometheus.BuildFQName("ping", "", "latency_minimum_ms"),
-		// Raw metrics (preserved from original)
-		sentSeconds: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "sent_seconds"),
-			"Total seconds spent sending packets.",
-			iperfLabels, nil,
-		),
-		sentBytes: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "sent_bytes"),
-			"Total sent bytes for the last test run.",
-			iperfLabels, nil,
-		),
-		receivedSeconds: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "received_seconds"),
-			"Total seconds spent receiving packets.",
-			iperfLabels, nil,
-		),
-		receivedBytes: prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, "", "received_bytes"),
-			"Total received bytes for the last test run.",
-			iperfLabels, nil,
-		),
 			"Ping minimum latency in milliseconds.",
 			pingLabels, nil,
 		),
