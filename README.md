@@ -1,14 +1,49 @@
-# iPerf3 Exporter
+# iPerf3 Exporter v3.1.1 (Enhanced by ThanhDeptr)
 
-A Prometheus exporter for iPerf3 network performance metrics.
+A Prometheus exporter for iPerf3 network performance metrics with advanced mutex mechanism to prevent concurrent test conflicts.
+
+---
+
+> **This is a fork of [edgard/iperf3_exporter](https://github.com/edgard/iperf3_exporter) with additional enhancements by ThanhDeptr**
+
+---
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/edgard/iperf3_exporter)](https://goreportcard.com/report/github.com/edgard/iperf3_exporter)
-[![Docker Pulls](https://img.shields.io/docker/pulls/ghcr.io/edgard/iperf3_exporter.svg)](https://github.com/users/edgard/packages/container/package/iperf3_exporter)
+[![Docker Pulls](https://img.shields.io/docker/pulls/hatanthanh/iperf3_exporter.svg)](https://hub.docker.com/r/hatanthanh/iperf3_exporter)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/edgard/iperf3_exporter/blob/master/LICENSE)
 
-## ⚠️ IMPORTANT: Docker Image Name Change
+## New Features (by ThanhDeptr)
 
-**The Docker image has moved to GitHub Container Registry (ghcr.io) and the name has changed from `iperf3-exporter` to `iperf3_exporter` following GitHub's naming standards. If you were using the old image name, please update your references.**
+- **Mutex Mechanism**: Prevents concurrent iPerf3 tests with global locking system
+- **Retry Logic**: Automatic retry mechanism for recoverable network errors
+- **Bidirectional Testing**: Simultaneous upload/download bandwidth measurement
+- **Bind Address Support**: Configure specific network interfaces for multi-WAN testing
+- **Parallel Streams**: Enhanced performance with configurable parallel connections
+- **Advanced Metrics**: Calculated bandwidth, latency, and packet loss metrics
+- **Ping Integration**: Combined iPerf3 + Ping testing for comprehensive network monitoring
+- **BusyBox Ping Support**: Compatible with Alpine Linux/BusyBox ping format
+- **Optimized Logging**: Clean, concise logging for better monitoring and debugging
+
+---
+
+## Mutex Mechanism
+
+The enhanced exporter includes a global mutex system that prevents concurrent iPerf3 tests from conflicting with each other. This is especially useful when monitoring multiple WAN connections simultaneously:
+
+- **Global Lock**: Only one iPerf3 test runs at a time across all requests
+- **Queue Management**: Subsequent requests wait for the current test to complete
+- **Timeout Protection**: Requests timeout after 500 seconds to prevent deadlocks
+- **Lock Status Endpoint**: Monitor lock status via `/lock-status` endpoint
+
+## Retry Logic
+
+The exporter now includes intelligent retry mechanism to handle temporary network issues and improve test reliability:
+
+- **Automatic Retry**: Up to 3 retry attempts for recoverable errors
+- **Smart Error Detection**: Retries on "Connection refused", "server busy", and "Connection reset by peer"
+- **Configurable Delay**: 3-second delay between retry attempts
+- **Context Awareness**: Respects timeout and cancellation from Prometheus
+- **Enhanced Logging**: Detailed error reporting with iPerf3 output for debugging
 
 The iPerf3 exporter allows iPerf3 probing of endpoints for Prometheus monitoring, enabling you to measure network performance metrics like bandwidth, jitter, and packet loss.
 
@@ -23,274 +58,117 @@ The iPerf3 exporter allows iPerf3 probing of endpoints for Prometheus monitoring
 - Health and readiness endpoints for monitoring
 - Prometheus metrics for exporter itself
 
-## Installation
+## Installation & Usage
+
+### Using Docker (Recommended)
+
+```bash
+docker run -d \
+  --user="root" \
+  --name iperf3_exporter_vn \
+  --network host \
+  --cap-add=NET_ADMIN \
+  --cap-add=NET_RAW \
+  --restart unless-stopped \
+  hatanthanh/iperf3_exporter:v3.1.1 \
+  --web.listen-address=:9580
+```
+
+**Docker Command Explanation:**
+- `--user="root"`: Run container as root user for full network access
+- `--name iperf3_exporter_vn`: Custom container name for Vietnamese deployment
+- `--network host`: Use host networking for direct network interface access
+- `--cap-add=NET_ADMIN --cap-add=NET_RAW`: Required capabilities for network testing
+- `--restart unless-stopped`: Auto-restart container unless manually stopped
+- `--web.listen-address=:9580`: Custom port 9580 for metrics endpoint
 
 ### From Binaries
 
-Download the most suitable binary for your platform from [the releases tab](https://github.com/edgard/iperf3_exporter/releases).
-
 ```bash
-# Download (replace VERSION and PLATFORM with appropriate values)
+# Download from releases
 curl -L -o iperf3_exporter https://github.com/edgard/iperf3_exporter/releases/download/VERSION/iperf3_exporter-VERSION.PLATFORM
-
-# Make executable
 chmod +x iperf3_exporter
-
-# Run
-./iperf3_exporter <flags>
-```
-
-*Note: [iperf3](https://iperf.fr/) binary should also be installed and accessible from the path.*
-
-### Using Docker
-
-```bash
-docker run --rm -d -p 9579:9579 --name iperf3_exporter ghcr.io/edgard/iperf3_exporter:latest
-```
-
-The Docker images are available for multiple architectures (amd64, arm64) and are published to GitHub Container Registry.
-
-### Building from Source
-
-```bash
-# Clone repository
-git clone https://github.com/edgard/iperf3_exporter.git
-cd iperf3_exporter
-
-# Build
-go build -o iperf3_exporter ./cmd/iperf3_exporter
-
-# Run
-./iperf3_exporter
-```
-
-## Usage
-
-### Starting the Exporter
-
-```bash
-./iperf3_exporter [flags]
+./iperf3_exporter --help
 ```
 
 ### Configuration
 
-iPerf3 exporter is configured via command-line flags:
+The exporter can be configured using command-line flags:
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--web.listen-address` | Addresses on which to expose metrics and web interface (repeatable) | `:9579` |
-| `--web.telemetry-path` | Path under which to expose metrics | `/metrics` |
-| `--web.probe-path` | Path under which to expose the probe endpoint | `/probe` |
-| `--iperf3.timeout` | iperf3 run timeout | `30s` |
-| `--web.config.file` | Path to configuration file that can enable TLS or authentication | |
-| `--web.systemd-socket` | Use systemd socket activation listeners instead of port listeners (Linux only) | `false` |
-| `--log.level` | Only log messages with the given severity or above | `info` |
-| `--log.format` | Output format of log messages | `logfmt` |
+- `--web.listen-address`: Address to listen on (default: `:9579`, custom: `:9580`)
+- `--web.telemetry-path`: Path under which to expose metrics (default: `/metrics`)
+- `--log.level`: Log level (default: `info`)
 
-#### Web Configuration File
+### Prometheus Configuration
 
-The exporter supports a configuration file for TLS and authentication settings. This file is specified with the `--web.config.file` flag.
-
-Example configuration file:
+Add the following to your `prometheus.yml`:
 
 ```yaml
-tls_server_config:
-  cert_file: server.crt
-  key_file: server.key
-
-basic_auth_users:
-  username: password
-```
-
-For more details on the web configuration file format, see the [exporter-toolkit documentation](https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md).
-
-To view all available command-line flags, run:
-
-```bash
-./iperf3_exporter -h
-```
-
-The timeout of each probe is automatically determined from the `scrape_timeout` in the [Prometheus config](https://prometheus.io/docs/operating/configuration/#configuration-file).
-This can be also be limited by the `iperf3.timeout` command-line flag. If neither is specified, it defaults to 30 seconds.
-
-### Probe Parameters
-
-When making requests to the `/probe` endpoint, the following parameters can be used:
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `target` | Target host to probe (required) | - |
-| `port` | Port that the target iperf3 server is listening on | 5201 |
-| `reverse_mode` | Run iperf3 in reverse mode (server sends, client receives) | false |
-| `udp_mode` | Run iperf3 in UDP mode instead of TCP | false |
-| `bitrate` | Target bitrate in bits/sec (format: #[KMG][/#]). For UDP mode, iperf3 defaults to 1 Mbit/sec if not specified. | - |
-| `period` | Duration of the iperf3 test | 5s |
-
-### Checking the Results
-
-Visit [http://localhost:9579](http://localhost:9579) to see the exporter's web interface.
-
-## Prometheus Configuration
-
-The iPerf3 exporter needs to be passed the target as a parameter, this can be done with relabelling.
-
-Example config:
-```yml
 scrape_configs:
   - job_name: 'iperf3'
-    metrics_path: /probe
     static_configs:
-      - targets:
-        - foo.server
-        - bar.server
+      - targets: ['localhost:9580']
+    metrics_path: '/probe'
     params:
+      target: ['your-target-host']
       port: ['5201']
-      # Optional: enable reverse mode
-      # reverse_mode: ['true']
-      # Optional: enable UDP mode
-      # udp_mode: ['true']
-      # Optional: set bitrate limit
-      # bitrate: ['100M']
-      # Optional: set test period
-      # period: ['10s']
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: 127.0.0.1:9579  # The iPerf3 exporter's real hostname:port.
+      period: ['10s']
+      bidirectional: ['true']
+      bind_address: ['192.168.1.100']
+      parallel: ['2']
 ```
 
-### Available Metrics
+## API Endpoints
 
-The exporter provides the following metrics:
+- `/metrics`: Prometheus metrics
+- `/probe`: iPerf3 probe endpoint
+- `/health`: Health check endpoint
+- `/ready`: Readiness check endpoint
+- `/lock-status`: Mutex lock status (new feature)
 
-| Metric | Description | Labels |
-|--------|-------------|--------|
-| `iperf3_up` | Was the last iperf3 probe successful (1 for success, 0 for failure) | `target`, `port` |
-| `iperf3_sent_seconds` | Total seconds spent sending packets | `target`, `port` |
-| `iperf3_sent_bytes` | Total sent bytes for the last test run | `target`, `port` |
-| `iperf3_received_seconds` | Total seconds spent receiving packets | `target`, `port` |
-| `iperf3_received_bytes` | Total received bytes for the last test run | `target`, `port` |
-| `iperf3_retransmits` | Total retransmits for the last test run (TCP mode only, omitted in UDP) | `target`, `port` |
-| `iperf3_sent_packets` | Total sent packets for the last UDP test run (UDP mode only) | `target`, `port` |
-| `iperf3_sent_jitter_ms` | Jitter in milliseconds for sent packets (UDP mode only) | `target`, `port` |
-| `iperf3_lost_packets` | Total lost packets for the last UDP test run (UDP mode only) | `target`, `port` |
-| `iperf3_lost_percent` | Percentage of packets lost for the last UDP test run (UDP mode only) | `target`, `port` |
+## Parameters
 
-Additionally, the exporter provides metrics about itself:
+- `target`: Target host for iPerf3 test
+- `port`: Port number (default: 5201)
+- `period`: Test duration (default: 10s)
+- `bidirectional`: Enable bidirectional testing (default: false)
+- `bind_address`: Bind to specific network interface
+- `parallel`: Number of parallel streams (default: 1)
 
-| Metric | Description |
-|--------|-------------|
-| `iperf3_exporter_duration_seconds` | Duration of collections by the iperf3 exporter |
-| `iperf3_exporter_errors_total` | Errors raised by the iperf3 exporter |
+## Metrics
 
-### Querying the Bandwidth
+The exporter in v3.1.1 exposes only the most important (core) network metrics. Metrics are now grouped, simplified, and designed for clarity and focus:
 
-You can use the following Prometheus queries to calculate bandwidth in Mbits/sec:
+**iPerf3 Metrics (Focus Only):**
+- `iperf3_up`: Whether the last iPerf3 probe was successful
+- `iperf3_bandwidth_upload_mbps`: Upload bandwidth in Mbps
+- `iperf3_bandwidth_download_mbps`: Download bandwidth in Mbps
+- `iperf3_retransmits`: TCP retransmit count (quality/stability)
+- `iperf3_jitter_ms`: UDP jitter, milliseconds (latency fluctuation)
 
-#### Receiver Bandwidth (Download Speed)
-```
-rate(iperf3_received_bytes{instance="target"}[1m]) * 8 / 1000000
-```
+**Ping Metrics (v3.1.1):**
+- `ping_up`: Whether ping probe to target was successful (1=success, 0=failure)
+- `ping_packet_loss_percent`: Percent packet loss for the test (0-100%)
+- `ping_latency_average_ms`: Average round-trip latency in milliseconds
+- `ping_latency_maximum_ms`: Maximum round-trip latency in milliseconds  
+- `ping_latency_minimum_ms`: Minimum round-trip latency in milliseconds
 
-#### Sender Bandwidth (Upload Speed)
-```
-rate(iperf3_sent_bytes{instance="target"}[1m]) * 8 / 1000000
-```
+> **Ping Integration**: The exporter now automatically runs ping tests after each iPerf3 test to provide comprehensive network monitoring. Ping metrics are collected using the same target and bind_address parameters as the iPerf3 test.
 
-These queries use the `rate()` function to calculate the per-second rate from the counter metrics, then convert from bytes to bits (multiply by 8) and from bits to megabits (divide by 1,000,000).
+> **NOTE:** Metrics such as `sent_bytes`, `received_bytes`, `sent_seconds`, etc. have been removed in favor of clarity. You get core, actionable, and easy-to-visualize metrics for direct use in Grafana dashboards and alerting.
+
 
 ## Contributing
 
-Contributions to the iperf3_exporter are welcome!
-
-This project follows the [Conventional Commits](https://www.conventionalcommits.org/) specification. When contributing, please format your commit messages according to this standard:
-
-```
-<type>(<scope>): <description>
-
-[optional body]
-
-[optional footer(s)]
-```
-
-Examples:
-- `feat: add support for UDP tests`
-- `fix: correct metric label in collector`
-- `docs: update installation instructions`
-- `refactor(collector): simplify error handling`
-
-### Development Prerequisites
-
-- Go 1.24 or higher
-- iperf3 installed on your system
-
-### Project Structure
-
-```
-.
-├── cmd/
-│   └── iperf3_exporter/     # Main application entry point
-├── internal/
-│   ├── collector/           # Prometheus collector implementation
-│   ├── config/              # Configuration handling
-│   ├── iperf/               # iperf3 command execution and result parsing
-│   └── server/              # HTTP server implementation
-├── tests/
-│   └── e2e/                 # End-to-end tests
-├── .github/
-│   └── workflows/           # GitHub Actions workflows
-├── .goreleaser.yml          # GoReleaser configuration
-├── Dockerfile               # Multi-arch Docker build configuration
-├── go.mod                   # Go module definition
-└── README.md                # This file
-```
-
-### Building and Testing
-
-The project uses a Makefile to streamline development tasks:
-
-```bash
-# Build the binary
-make build
-
-# Run all tests
-make test
-
-# Complete development workflow (run mod, generate, lint, vet, tests and build)
-make all
-
-# Tidy and download dependencies
-make mod
-
-# Run linting
-make lint
-
-# Run go vet
-make vet
-
-# Generate code (if any generators are configured)
-make generate
-
-# Build Docker image for local development
-make docker
-
-# See all available commands
-make help
-```
-
-You can also use standard Go commands directly:
-
-```bash
-# Build manually
-go build -o iperf3_exporter ./cmd/iperf3_exporter
-
-# Run tests
-go test ./...
-```
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests
+5. Submit a pull request
 
 ## License
 
 This project is released under Apache License 2.0, see [LICENSE](https://github.com/edgard/iperf3_exporter/blob/master/LICENSE).
+
+**Original Repository**: [edgard/iperf3_exporter](https://github.com/edgard/iperf3_exporter)  
+**Enhanced Fork v2**: [Thanhdeptr/iperf3_exporter_mutex](https://github.com/Thanhdeptr/iperf3_exporter_mutex)
